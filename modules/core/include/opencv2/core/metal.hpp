@@ -23,6 +23,17 @@ CV_EXPORTS bool haveMetal();
 
 //! @cond INTERNAL
 CV_EXPORTS bool threshold(const UMat& src, UMat& dst, double thresh, double maxval, int thresholdType);
+
+// Experimental device-interop accessors. They let out-of-core device backends (for example
+// the experimental dnn Metal executor) reach the raw Metal objects behind a Metal-backed
+// UMat without pulling in core-private headers. The returned pointers are the underlying
+// id<MTLBuffer> / id<MTLDevice> / id<MTLCommandQueue> handed back as void*; they are owned by
+// OpenCV and must not be released by the caller. Each returns NULL when Metal is unavailable
+// or the UMat is not Metal-backed.
+CV_EXPORTS void* getMTLBuffer(const UMat& m);
+CV_EXPORTS void* getMTLBufferContents(const UMat& m); // host pointer, or NULL if not host-visible
+CV_EXPORTS void* getMTLDevice();
+CV_EXPORTS void* getMTLCommandQueue();
 //! @endcond
 
 } // namespace metal

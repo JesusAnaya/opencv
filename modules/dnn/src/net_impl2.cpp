@@ -6,6 +6,10 @@
 
 #include "net_impl.hpp"
 
+#ifdef HAVE_METAL
+#include "metal/dnn_metal.hpp"
+#endif
+
 #include <limits>
 
 #ifdef HAVE_ONNXRUNTIME
@@ -1198,6 +1202,11 @@ void Net::Impl::forwardGraph(Ptr<Graph>& graph, InputArrayOfArrays inputs_,
         if (!subgraphs) {
             if (finalizeLayers)
                 layer->finalize(inpMats, outMats);
+#ifdef HAVE_METAL
+            // Experimental: try the Metal/MPSGraph executor first; it returns false (and we
+            // fall through to the CPU path) for any op or configuration it does not handle.
+            if (!cv::dnn::metal::tryForward(layer, inpMats, outMats, tempMats))
+#endif
             layer->forward(inpMats, outMats, tempMats);
         }
         else {

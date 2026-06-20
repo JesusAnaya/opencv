@@ -511,6 +511,23 @@ else()
   message(STATUS "DNN: MLAS (vendored) disabled — host arch/OS not wired up.")
 endif()
 
+# Experimental Metal/MPSGraph per-op executor for the new dnn engine (Apple GPU). It is gated
+# on HAVE_METAL (the same flag that enables the core Metal UMat backend); the .mm sources under
+# src/metal/ are auto-globbed by ocv_glob_module_sources on Apple and self-disable via
+# #ifdef HAVE_METAL otherwise. The MetalPerformanceShaders(+Graph) frameworks are linked here
+# (not into core); on macOS 11+ they ship with Metal.
+if(HAVE_METAL)
+  list(APPEND include_dirs "${OpenCV_SOURCE_DIR}/modules/core/src/metal")
+  list(APPEND libs ${METAL_LIBRARIES})
+  if(MPS_LIBRARY AND MPSGRAPH_LIBRARY)
+    list(APPEND libs "${MPS_LIBRARY}" "${MPSGRAPH_LIBRARY}")
+    message(STATUS "DNN: experimental Metal/MPSGraph executor enabled.")
+  else()
+    message(STATUS "DNN: Metal found but MetalPerformanceShadersGraph missing; "
+                   "the Metal executor will not link - update the macOS SDK (11+).")
+  endif()
+endif()
+
 ocv_module_include_directories(${include_dirs})
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   ocv_append_source_files_cxx_compiler_options(fw_srcs "-Wno-suggest-override")  # GCC
