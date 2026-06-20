@@ -47,7 +47,8 @@ bool tryForward(const Ptr<Layer>& layer,
 
 // Op bodies (implemented in mps_ops.mm). Each returns true on success, false to decline.
 bool mpsConv(const Ptr<Layer>& layer, std::vector<Mat>& inputs, std::vector<Mat>& outputs);
-bool mpsRelu(const Ptr<Layer>& layer, std::vector<Mat>& inputs, std::vector<Mat>& outputs);
+// Unary elementwise activations (ReLU, Sigmoid, TanH, Exp, AbsVal), dispatched by layer->type.
+bool mpsUnary(const Ptr<Layer>& layer, std::vector<Mat>& inputs, std::vector<Mat>& outputs);
 
 // Verbose logging gate (OPENCV_DNN_METAL_VERBOSE), shared by the op bodies.
 bool verbose();

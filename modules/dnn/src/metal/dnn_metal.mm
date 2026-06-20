@@ -91,8 +91,9 @@ bool tryForward(const Ptr<Layer>& layer,
         const String& type = layer->type;
         if (type == "Conv2" || type == "Convolution")
             handled = mpsConv(layer, inputs, outputs);
-        else if (type == "ReLU")
-            handled = mpsRelu(layer, inputs, outputs);
+        else if (type == "ReLU" || type == "Sigmoid" || type == "TanH" ||
+                 type == "Exp" || type == "AbsVal")
+            handled = mpsUnary(layer, inputs, outputs);
     }
 
     if (handled)

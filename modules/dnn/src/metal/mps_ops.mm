@@ -212,7 +212,18 @@ bool mpsConv(const Ptr<Layer>& layer, std::vector<Mat>& inputs, std::vector<Mat>
     return readBack(results[outT], dst);
 }
 
-bool mpsRelu(const Ptr<Layer>& layer, std::vector<Mat>& inputs, std::vector<Mat>& outputs)
+// Pick the MPSGraph op for a dnn unary-activation type. Returns nil to decline.
+static MPSGraphTensor* applyUnary(MPSGraph* graph, MPSGraphTensor* in, const String& type)
+{
+    if (type == "ReLU")    return [graph reLUWithTensor:in name:nil];
+    if (type == "Sigmoid") return [graph sigmoidWithTensor:in name:nil];
+    if (type == "TanH")    return [graph tanhWithTensor:in name:nil];
+    if (type == "Exp")     return [graph exponentWithTensor:in name:nil];
+    if (type == "AbsVal")  return [graph absoluteWithTensor:in name:nil];
+    return nil;
+}
+
+bool mpsUnary(const Ptr<Layer>& layer, std::vector<Mat>& inputs, std::vector<Mat>& outputs)
 {
     if (inputs.empty() || outputs.empty())
         return false;
@@ -223,10 +234,14 @@ bool mpsRelu(const Ptr<Layer>& layer, std::vector<Mat>& inputs, std::vector<Mat>
     if (src.dims != dst.dims || src.total() != dst.total())
         return false;
 
-    Ptr<ReLULayer> relu = layer.dynamicCast<ReLULayer>();
-    const float slope = relu.empty() ? 0.f : relu->negativeSlope;
-    if (slope != 0.f)                               // plain ReLU only for the PoC
-        return false;
+    // ReLU is the only unary here with a parameter: handle plain ReLU (negativeSlope == 0)
+    // and decline leaky ReLU. The others are parameter-free.
+    if (layer->type == "ReLU")
+    {
+        Ptr<ReLULayer> relu = layer.dynamicCast<ReLULayer>();
+        if (!relu.empty() && relu->negativeSlope != 0.f)
+            return false;
+    }
 
     id<MTLCommandQueue> queue = (id<MTLCommandQueue>)cv::metal::getMTLCommandQueue();
     if (queue == nil)
@@ -236,7 +251,9 @@ bool mpsRelu(const Ptr<Layer>& layer, std::vector<Mat>& inputs, std::vector<Mat>
 
     MPSGraph* graph = [[[MPSGraph alloc] init] autorelease];
     MPSGraphTensor* srcT = [graph placeholderWithShape:shape dataType:MPSDataTypeFloat32 name:@"src"];
-    MPSGraphTensor* outT = [graph reLUWithTensor:srcT name:@"relu"];
+    MPSGraphTensor* outT = applyUnary(graph, srcT, layer->type);
+    if (outT == nil)
+        return false;
 
     MetalTensor srcMt;
     if (!uploadTensor(srcMt, src))
@@ -255,7 +272,8 @@ bool mpsRelu(const Ptr<Layer>& layer, std::vector<Mat>& inputs, std::vector<Mat>
     @catch (NSException* e)
     {
         if (verbose())
-            CV_LOG_WARNING(NULL, "dnn/metal: MPSGraph relu threw: " << [[e reason] UTF8String]);
+            CV_LOG_WARNING(NULL, "dnn/metal: MPSGraph unary '" << layer->type << "' threw: "
+                           << [[e reason] UTF8String]);
         return false;
     }
 

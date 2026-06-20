@@ -95,6 +95,41 @@ TEST(Test_Metal_MPS, relu)
     EXPECT_GE(executed, 1) << "ReLU did not execute on the Metal/MPSGraph path";
 }
 
+// More layout-neutral unary activations that reach Metal the same way as ReLU. The random
+// input is uniform[-1,1], a domain on which all four ops are well defined (Sqrt is omitted
+// because it is NaN on negatives).
+TEST(Test_Metal_MPS, sigmoid)
+{
+    int executed = runAndCheckParity(sigmoid_onnx, sigmoid_onnx_len, {1, 4, 8, 8}, "sigmoid");
+    if (executed < 0)
+        return;
+    EXPECT_GE(executed, 1) << "Sigmoid did not execute on the Metal/MPSGraph path";
+}
+
+TEST(Test_Metal_MPS, tanh)
+{
+    int executed = runAndCheckParity(tanh_onnx, tanh_onnx_len, {1, 4, 8, 8}, "tanh");
+    if (executed < 0)
+        return;
+    EXPECT_GE(executed, 1) << "TanH did not execute on the Metal/MPSGraph path";
+}
+
+TEST(Test_Metal_MPS, exp)
+{
+    int executed = runAndCheckParity(exp_onnx, exp_onnx_len, {1, 4, 8, 8}, "exp");
+    if (executed < 0)
+        return;
+    EXPECT_GE(executed, 1) << "Exp did not execute on the Metal/MPSGraph path";
+}
+
+TEST(Test_Metal_MPS, abs)
+{
+    int executed = runAndCheckParity(abs_onnx, abs_onnx_len, {1, 4, 8, 8}, "abs");
+    if (executed < 0)
+        return;
+    EXPECT_GE(executed, 1) << "AbsVal did not execute on the Metal/MPSGraph path";
+}
+
 // The new engine repacks conv activations into a blocked layout (useBlockLayout) and fuses
 // Conv+activation before execution, so the plain-NCHW Metal conv executor currently declines and
 // the op runs on CPU. These tests assert that the decline is SAFE (enabling Metal does not change
