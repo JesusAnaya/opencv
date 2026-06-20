@@ -380,6 +380,13 @@ CV__DNN_INLINE_NS_BEGIN
         int ngroups;
         AutoPadding auto_pad;
         bool ceil_mode;
+
+        // Experimental: set when a non-CPU device executor has claimed this convolution, to keep
+        // it on the plain-NCHW path (no block-layout repack, no activation fusion) so the device
+        // backend can run it. Default false: ordinary CPU lowering is unaffected. Backend-agnostic
+        // by design (the generic graph passes only read this flag; a specific device backend sets
+        // it).
+        bool deviceClaimed = false;
     };
 
     struct Conv2Int8Params

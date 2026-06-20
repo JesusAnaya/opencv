@@ -50,6 +50,21 @@ bool mpsConv(const Ptr<Layer>& layer, std::vector<Mat>& inputs, std::vector<Mat>
 // Unary elementwise activations (ReLU, Sigmoid, TanH, Exp, AbsVal), dispatched by layer->type.
 bool mpsUnary(const Ptr<Layer>& layer, std::vector<Mat>& inputs, std::vector<Mat>& outputs);
 
+// Single source of truth for "can the Metal conv executor run this Conv2?". It encodes EXACTLY
+// the constraints mpsConv enforces, expressed over statically-known facts (dtype, weight rank,
+// const-ness, and the spatial config). The claim pass (metal_claim.cpp) calls it before the CPU
+// lowering passes; mpsConv calls it again at run time. Because both use this one function, a
+// claimed conv is guaranteed to be accepted at the seam, so it never falls through to the CPU
+// Conv2::forward (which asserts a block layout the claimed conv no longer has).
+// autoPad is the Conv2Layer::AutoPadding value as an int (0 == AUTO_PAD_NONE).
+bool metalConvSupported(int actType,
+                        int weightType, int weightDims, bool weightConst,
+                        bool hasBias, int biasType, bool biasConst,
+                        const std::vector<int>& strides,
+                        const std::vector<int>& dilations,
+                        const std::vector<int>& pads,
+                        int autoPad);
+
 // Verbose logging gate (OPENCV_DNN_METAL_VERBOSE), shared by the op bodies.
 bool verbose();
 

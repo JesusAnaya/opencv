@@ -520,12 +520,24 @@ struct Net::Impl : public detail::NetImplBase
     void useBlockLayout();
     // fuse BN into following Conv2 weights
     void fuseBN();
+    // experimental: mark Conv2 ops the Metal/MPSGraph executor can run, before the block-layout
+    // lowering passes, so they stay on the plain-NCHW path. No-op unless built with HAVE_METAL
+    // and the Metal executor is enabled at runtime.
+    void claimMetalConvs();
 
 };  // Net::Impl
 
 inline Net::Impl* getNetImpl(const Layer* layer)
 {
     return reinterpret_cast<Net::Impl*>(layer->netimpl);
+}
+
+// True when the host (CPU) layout/fusion passes may transform this convolution normally. Returns
+// false (so the passes leave it as plain NCHW and unfused) when a device executor has claimed it
+// via Conv2Layer::deviceClaimed. Null-safe, so call sites need no separate conv != nullptr check.
+inline bool convLowersOnHost(const Conv2Layer* conv)
+{
+    return conv && !conv->deviceClaimed;
 }
 
 Net readNetFromONNX2(const String&);

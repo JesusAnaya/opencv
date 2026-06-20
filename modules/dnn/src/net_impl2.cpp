@@ -552,6 +552,7 @@ void Net::Impl::prepareForInference()
         fuseQDQ();
         constFold();
         fuseBN();
+        claimMetalConvs();  // experimental: keep Metal-runnable convs on the NCHW path (no-op otherwise)
         constArgs();
         fuseAttention();
         fuseMatMulConstBToGemm();

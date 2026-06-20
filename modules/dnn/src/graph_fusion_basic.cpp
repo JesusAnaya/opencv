@@ -106,7 +106,7 @@ struct ModelFusionBasic
                         }
 
                         Conv2Layer* conv = getLayer<Conv2Layer>(newprog, conv_layer_idx);
-                        if (conv && usecounts[conv_out.idx] == 1 &&
+                        if (convLowersOnHost(conv) && usecounts[conv_out.idx] == 1 &&
                             conv->fuseAddResidual(residual)) {
                             fused_layer_idx = conv_layer_idx;
                             removed_args.push_back(conv_out);
@@ -121,7 +121,7 @@ struct ModelFusionBasic
                     Arg activ_inp = inputs[0];
                     int conv_layer_idx = producer_of.at(activ_inp.idx);
                     Conv2Layer* conv = getLayer<Conv2Layer>(newprog, conv_layer_idx);
-                    if (conv) {
+                    if (convLowersOnHost(conv)) {
                         bool ok = conv->fuseActivation(layer);
                         if (ok) {
                             fused_layer_idx = conv_layer_idx;

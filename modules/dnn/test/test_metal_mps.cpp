@@ -84,6 +84,52 @@ static int runAndCheckParity(const unsigned char* blob, size_t len,
     return executed;
 }
 
+// Conv needs a different harness than the elementwise ops. Running a conv on Metal requires the
+// claim pass (in prepareForInference) to mark it BEFORE the block-layout lowering, and that pass
+// runs only once per Net (cached by the 'prepared' flag) and only when Metal is enabled. So we
+// cannot toggle Metal on a single already-prepared Net; instead we use two fresh Nets: a
+// reference Net that lives entirely with Metal disabled (pure CPU block-layout path), and a test
+// Net that has Metal enabled before its first forward (so the claim pass engages). The results
+// must match, and the returned counter says how many ops actually ran on the GPU. Returns -1 when
+// skipped (classic engine forced).
+static int runAndCheckParityTwoNets(const unsigned char* blob, size_t len,
+                                    const std::vector<int>& inShape, const char* name)
+{
+    if (!cv::metal::haveMetal())
+        throw SkipTestException("Metal backend is not available on this machine");
+    if (classicEngineForced())
+    {
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_PARSER);
+        return -1;
+    }
+
+    MetalGuard guard;
+
+    std::vector<uchar> model(blob, blob + len);
+    Mat input(inShape, CV_32F);
+    RNG rng(0x42);
+    rng.fill(input, RNG::UNIFORM, -1.0, 1.0);
+
+    // Reference: Metal disabled for the whole life of this Net (CPU block-layout path).
+    cv::dnn::metal::setEnabled(false);
+    Net refNet = readNetFromONNX(model, ENGINE_NEW);
+    EXPECT_FALSE(refNet.empty());
+    refNet.setInput(input);
+    Mat ref = refNet.forward().clone();
+
+    // Test: Metal enabled before the first forward, so the claim pass marks supported convs.
+    cv::dnn::metal::setEnabled(true);
+    cv::dnn::metal::resetCounters();
+    Net testNet = readNetFromONNX(model, ENGINE_NEW);
+    EXPECT_FALSE(testNet.empty());
+    testNet.setInput(input);
+    Mat out = testNet.forward().clone();
+    const int executed = cv::dnn::metal::opsExecuted();
+
+    normAssert(ref, out, name, /*l1*/ 1e-4, /*lInf*/ 1e-3);
+    return executed;
+}
+
 // ReLU is elementwise, so the new engine does not repack it into a blocked layout: it runs
 // end-to-end on the Apple GPU via MPSGraph and must match the CPU result. This is the primary
 // Phase 0 proof that a real NN op executes on Metal through the new dnn engine.
@@ -130,24 +176,39 @@ TEST(Test_Metal_MPS, abs)
     EXPECT_GE(executed, 1) << "AbsVal did not execute on the Metal/MPSGraph path";
 }
 
-// The new engine repacks conv activations into a blocked layout (useBlockLayout) and fuses
-// Conv+activation before execution, so the plain-NCHW Metal conv executor currently declines and
-// the op runs on CPU. These tests assert that the decline is SAFE (enabling Metal does not change
-// the output). Running conv on Metal requires claiming the op before useBlockLayout (Phase 1).
-TEST(Test_Metal_MPS, conv_block_layout_declines)
+// A supported convolution (explicit padding, constant fp32 OIHW weights) is claimed before the
+// block-layout lowering, so it stays in plain NCHW and runs on the Apple GPU via MPSGraph. The
+// result must match the CPU reference. This is the Phase 1 headline: a real conv on Metal.
+TEST(Test_Metal_MPS, conv_runs_on_metal)
 {
-    int executed = runAndCheckParity(conv_onnx, conv_onnx_len, {1, 3, 8, 8}, "conv");
+    int executed = runAndCheckParityTwoNets(conv_onnx, conv_onnx_len, {1, 3, 8, 8}, "conv");
     if (executed < 0)
-        return;
-    EXPECT_EQ(executed, 0) << "conv unexpectedly ran on Metal - block-layout handling changed";
+        return; // skipped (classic engine)
+    EXPECT_GE(executed, 1) << "conv did not execute on the Metal/MPSGraph path";
 }
 
-TEST(Test_Metal_MPS, conv_relu_block_layout_declines)
+// With the conv claimed, the activation is no longer fused into it (fusion is skipped for claimed
+// convs), so both the conv and the following ReLU run as separate ops on Metal: the conv via
+// mpsConv, the ReLU via mpsUnary. Hence at least two ops execute on the GPU.
+TEST(Test_Metal_MPS, conv_relu_runs_on_metal)
 {
-    int executed = runAndCheckParity(conv_relu_onnx, conv_relu_onnx_len, {1, 3, 8, 8}, "conv_relu");
+    int executed = runAndCheckParityTwoNets(conv_relu_onnx, conv_relu_onnx_len, {1, 3, 8, 8}, "conv_relu");
     if (executed < 0)
         return;
-    EXPECT_EQ(executed, 0) << "fused conv+relu unexpectedly ran on Metal";
+    EXPECT_GE(executed, 2) << "conv+relu did not both execute on the Metal/MPSGraph path";
+}
+
+// A conv with auto_pad=SAME_UPPER is outside what the Metal executor handles in this phase, so the
+// claim predicate declines it and it keeps the ordinary CPU block-layout path. This pins the
+// safety invariant: an unsupported conv is never claimed (executed == 0) and still produces the
+// correct result with no crash, even with Metal enabled before the first forward.
+TEST(Test_Metal_MPS, conv_declined_falls_back)
+{
+    int executed = runAndCheckParityTwoNets(conv_declined_onnx, conv_declined_onnx_len,
+                                            {1, 3, 8, 8}, "conv_declined");
+    if (executed < 0)
+        return;
+    EXPECT_EQ(executed, 0) << "a SAME_UPPER conv must not run on Metal in this phase";
 }
 
 }} // namespace

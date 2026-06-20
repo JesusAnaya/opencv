@@ -80,6 +80,15 @@ bool pair2(const std::vector<size_t>& v, size_t def, size_t& row, size_t& col)
     return false; // 1D/3D conv not handled here
 }
 
+// Same for a Conv2Layer int vector (strides/dilations). Sizes are pre-validated by
+// metalConvSupported (empty or 2), so this never has to reject.
+void intPair(const std::vector<int>& v, size_t def, size_t& row, size_t& col)
+{
+    if (v.size() == 2)      { row = (size_t)v[0]; col = (size_t)v[1]; }
+    else if (v.size() == 1) { row = col = (size_t)v[0]; }
+    else                    { row = col = def; }
+}
+
 // Read a graph result back into a (continuous) host Mat. strideBytes:nil means tightly packed
 // row-major, which matches a continuous NCHW float Mat.
 bool readBack(MPSGraphTensorData* data, Mat& dst)
@@ -95,43 +104,17 @@ bool readBack(MPSGraphTensorData* data, Mat& dst)
 
 } // namespace
 
-bool mpsConv(const Ptr<Layer>& layer, std::vector<Mat>& inputs, std::vector<Mat>& outputs)
+// Build and run a single 2D NCHW convolution (weights OIHW, optional per-output-channel bias)
+// on MPSGraph, reading the result back into dst. All callers funnel through here so the GPU op
+// itself is written once. Returns false only on an infrastructure failure (no device, MPS throw).
+static bool runMpsConv2D(const Mat& src, const Mat& weights, const Mat& bias,
+                         size_t sH, size_t sW, size_t dH, size_t dW,
+                         size_t pT, size_t pL, size_t pB, size_t pR,
+                         int groups, Mat& dst)
 {
-    if (inputs.empty() || outputs.empty())
-        return false;
-    Mat& src = inputs[0];
-    Mat& dst = outputs[0];
-    if (src.type() != CV_32F || dst.type() != CV_32F)
-        return false;
-    if (src.dims != 4 || dst.dims != 4)             // 2D conv (NCHW) only for the PoC
-        return false;
-
-    Ptr<BaseConvolutionLayer> conv = layer.dynamicCast<BaseConvolutionLayer>();
-    if (conv.empty())
-        return false;
-
-    // Constant weights/bias only (the common folded-initializer case). Variable weights
-    // (inputs[1]/inputs[2]) are declined for the PoC.
-    if (layer->blobs.empty())
-        return false;
-    Mat weights = layer->blobs[0];
-    Mat bias = layer->blobs.size() > 1 ? layer->blobs[1] : Mat();
-    if (weights.type() != CV_32F || weights.dims != 4)
-        return false;
-    if (!bias.empty() && bias.type() != CV_32F)
-        return false;
-
     const int N = src.size[0], C = src.size[1], H = src.size[2], W = src.size[3];
     const int O = weights.size[0], Ig = weights.size[1], kH = weights.size[2], kW = weights.size[3];
     if (Ig <= 0 || C % Ig != 0)
-        return false;
-    const int groups = C / Ig;
-
-    size_t sH, sW, dH, dW, pT, pL, pB, pR;
-    if (!pair2(conv->strides, 1, sH, sW) ||
-        !pair2(conv->dilations, 1, dH, dW) ||
-        !pair2(conv->pads_begin, 0, pT, pL) ||
-        !pair2(conv->pads_end, 0, pB, pR))
         return false;
 
     // Expected output spatial size with explicit padding; must match the engine-allocated dst.
@@ -210,6 +193,106 @@ bool mpsConv(const Ptr<Layer>& layer, std::vector<Mat>& inputs, std::vector<Mat>
     }
 
     return readBack(results[outT], dst);
+}
+
+bool metalConvSupported(int actType,
+                        int weightType, int weightDims, bool weightConst,
+                        bool hasBias, int biasType, bool biasConst,
+                        const std::vector<int>& strides,
+                        const std::vector<int>& dilations,
+                        const std::vector<int>& pads,
+                        int autoPad)
+{
+    if (actType != CV_32F)
+        return false;
+    if (!weightConst || weightType != CV_32F || weightDims != 4)
+        return false;
+    if (hasBias && (!biasConst || biasType != CV_32F))
+        return false;
+    if (!(strides.empty()   || strides.size()   == 2))
+        return false;
+    if (!(dilations.empty() || dilations.size() == 2))
+        return false;
+    // SAME_UPPER/SAME_LOWER/VALID need the runtime input shape to resolve padding; decline them
+    // in this phase and keep only explicit (NOTSET) padding, given as [padT, padL, padB, padR].
+    if (autoPad != (int)AUTO_PAD_NONE)
+        return false;
+    if (!(pads.empty() || pads.size() == 4))
+        return false;
+    return true;
+}
+
+bool mpsConv(const Ptr<Layer>& layer, std::vector<Mat>& inputs, std::vector<Mat>& outputs)
+{
+    if (inputs.empty() || outputs.empty())
+        return false;
+    Mat& dst = outputs[0];
+    if (dst.type() != CV_32F || dst.dims != 4)
+        return false;
+
+    // New-engine convolution (type "Conv2"): weights/bias are plain OIHW constant inputs
+    // (inputs[1]/inputs[2], left unfolded for claimed convs); the spatial config lives on the
+    // public Conv2Layer fields. This path is only reached for a conv the claim pass marked as
+    // deviceClaimed, and metalConvSupported() here mirrors the claim predicate exactly, so a
+    // claimed conv is always accepted (never falls through to the block-layout CPU assert).
+    Conv2Layer* conv2 = dynamic_cast<Conv2Layer*>(layer.get());
+    if (conv2)
+    {
+        Mat& src = inputs[0];
+        if (src.type() != CV_32F || src.dims != 4 || inputs.size() < 2)
+            return false;
+        const Mat& weights = inputs[1];
+        Mat bias = inputs.size() > 2 ? inputs[2] : Mat();
+        const bool hasBias = !bias.empty();
+        if (!metalConvSupported(src.type(),
+                                weights.type(), weights.dims, /*weightConst*/ true,
+                                hasBias, hasBias ? bias.type() : 0, /*biasConst*/ true,
+                                conv2->strides, conv2->dilations, conv2->pads,
+                                (int)conv2->auto_pad))
+            return false;
+
+        size_t sH, sW, dH, dW;
+        intPair(conv2->strides, 1, sH, sW);
+        intPair(conv2->dilations, 1, dH, dW);
+        size_t pT = 0, pL = 0, pB = 0, pR = 0;
+        if (conv2->pads.size() == 4)
+        {
+            pT = (size_t)conv2->pads[0]; pL = (size_t)conv2->pads[1];
+            pB = (size_t)conv2->pads[2]; pR = (size_t)conv2->pads[3];
+        }
+        const int groups = conv2->ngroups > 0 ? conv2->ngroups : 1;
+        return runMpsConv2D(src, weights, hasBias ? bias : Mat(),
+                            sH, sW, dH, dW, pT, pL, pB, pR, groups, dst);
+    }
+
+    // Legacy "Convolution" layer (classic engine): constant weights/bias live in blobs.
+    Mat& src = inputs[0];
+    if (src.type() != CV_32F || src.dims != 4)
+        return false;
+
+    Ptr<BaseConvolutionLayer> conv = layer.dynamicCast<BaseConvolutionLayer>();
+    if (conv.empty() || layer->blobs.empty())
+        return false;
+    Mat weights = layer->blobs[0];
+    Mat bias = layer->blobs.size() > 1 ? layer->blobs[1] : Mat();
+    if (weights.type() != CV_32F || weights.dims != 4)
+        return false;
+    if (!bias.empty() && bias.type() != CV_32F)
+        return false;
+
+    const int C = src.size[1], Ig = weights.size[1];
+    if (Ig <= 0 || C % Ig != 0)
+        return false;
+    const int groups = C / Ig;
+
+    size_t sH, sW, dH, dW, pT, pL, pB, pR;
+    if (!pair2(conv->strides, 1, sH, sW) ||
+        !pair2(conv->dilations, 1, dH, dW) ||
+        !pair2(conv->pads_begin, 0, pT, pL) ||
+        !pair2(conv->pads_end, 0, pB, pR))
+        return false;
+
+    return runMpsConv2D(src, weights, bias, sH, sW, dH, dW, pT, pL, pB, pR, groups, dst);
 }
 
 // Pick the MPSGraph op for a dnn unary-activation type. Returns nil to decline.

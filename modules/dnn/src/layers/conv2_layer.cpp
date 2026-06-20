@@ -324,6 +324,16 @@ public:
     {
         size_t ninputs = actualInputs.size();
         CV_Assert(ninputs >= 1u && requiredOutputs == 1u);
+        if (deviceClaimed)
+        {
+            // Claimed by a device executor: stay in plain NCHW (no block repack), like a
+            // layout-neutral op. This stops useBlockLayout() from inserting a TransformLayout
+            // before the conv, so forward() receives ordinary NCHW (not the block layout it
+            // would otherwise assert). The op is executed at the seam by the device backend.
+            desiredInputs.assign(ninputs, DATA_LAYOUT_UNKNOWN);
+            outputs.assign(requiredOutputs, DATA_LAYOUT_UNKNOWN);
+            return 0;
+        }
         desiredInputs = actualInputs;
         desiredInputs[0] = DATA_LAYOUT_BLOCK;
         for (size_t i = 1; i < ninputs; i++)

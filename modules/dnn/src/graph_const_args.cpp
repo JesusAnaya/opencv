@@ -71,7 +71,7 @@ struct ConstArgs
             //ActivationLayer* activ = dynamic_cast<ActivationLayer*>(layer_ptr);
 
             if (tail_const) {
-                if (conv) {
+                if (convLowersOnHost(conv)) {
                     // convolution with constant weights and bias
                     conv->setWeights(netimpl->__tensors__[inputs[1]],
                                      ninputs > 2 ? netimpl->__tensors__[inputs[2]] : Mat(),
