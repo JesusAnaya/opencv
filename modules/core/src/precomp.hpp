@@ -265,6 +265,13 @@ BinaryFunc getConvertFunc(int sdepth, int ddepth);
 BinaryFunc getConvertScaleFunc(int sdepth, int ddepth);
 BinaryFunc getCopyMaskFunc(size_t esz);
 
+// Broadcast planner shared by cv::broadcast (matrix_transform.cpp) and the broadcasting
+// element-wise path (arithm.cpp). Prepends size-1 dims to make all arrays max_ndims-dimensional,
+// flattens contiguous runs, and sets the step of every broadcast (size-1) axis to 0.
+// Shapes/steps are in element units; every input array is assumed contiguous.
+bool flattenForBroadcast(int narrays, int max_ndims, const int* ndims, const int** orig_shape,
+                         int** flatten_shape, size_t** flatten_step);
+
 /* default memory block for sparse array elements */
 #define  CV_SPARSE_MAT_BLOCK     (1<<12)
 

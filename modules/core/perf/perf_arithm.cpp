@@ -35,6 +35,41 @@ INSTANTIATE_TEST_CASE_P(/*nothing*/ , BroadcastTest,
     )
 );
 
+// Broadcasting element-wise arithmetic (issues #29311/#29315). The first parameter set is an
+// equal-shape baseline (must match the non-broadcast path); the rest exercise each broadcast
+// direction and the parallel path on a large output.
+using BroadcastBinaryOpTest = perf::TestBaseWithParam<std::tuple<std::vector<int>, std::vector<int>, perf::MatType>>;
+
+PERF_TEST_P_(BroadcastBinaryOpTest, add)
+{
+    std::vector<int> shape_a = get<0>(GetParam());
+    std::vector<int> shape_b = get<1>(GetParam());
+    int dt_type = get<2>(GetParam());
+
+    cv::Mat a(static_cast<int>(shape_a.size()), shape_a.data(), dt_type);
+    cv::Mat b(static_cast<int>(shape_b.size()), shape_b.data(), dt_type);
+    cv::Mat c;
+
+    // n-d inputs: fill directly (declare.in() would call Size() on >2D Mats)
+    cv::randu(a, -1.f, 1.f);
+    cv::randu(b, -1.f, 1.f);
+
+    TEST_CYCLE() cv::add(a, b, c);
+
+    SANITY_CHECK_NOTHING();
+}
+
+INSTANTIATE_TEST_CASE_P(/*nothing*/ , BroadcastBinaryOpTest,
+    testing::Combine(
+        testing::Values(std::vector<int>{10, 100, 800}),
+        testing::Values(std::vector<int>{10, 100, 800},  // equal-shape baseline
+                        std::vector<int>{1, 100, 800},
+                        std::vector<int>{10, 1, 800},
+                        std::vector<int>{10, 100, 1}),
+        testing::Values(CV_32FC1)
+    )
+);
+
 PERF_TEST_P_(BinaryOpTest, min)
 {
     Size sz = get<0>(GetParam());

@@ -2685,6 +2685,170 @@ INSTANTIATE_TEST_CASE_P(Arithm, FlipND, testing::Combine(
     testing::Values(perf::MatType(CV_8UC1), CV_32FC1)
 ));
 
+// ---- Broadcasting element-wise arithmetic (issues #29311/#29315) ----
+
+// Reference broadcast that supports any type and channel count (cv::broadcast is single-channel
+// only), used to build the golden inputs for the broadcasting add/subtract/multiply/divide path.
+static Mat manualBroadcast(const Mat& src_, const std::vector<int>& outShape)
+{
+    Mat src = src_.isContinuous() ? src_ : src_.clone();
+    const int n = static_cast<int>(outShape.size());
+    Mat dst(n, outShape.data(), src.type());
+    const size_t esz = src.elemSize();
+    const int sn = src.dims;
+
+    std::vector<int> sshape(n, 1);
+    for (int i = 0; i < sn; i++)
+        sshape[i + (n - sn)] = src.size[i];
+
+    std::vector<size_t> sstride(n, 0);
+    size_t acc = 1;
+    for (int i = n - 1; i >= 0; i--)
+    {
+        sstride[i] = (sshape[i] == 1) ? 0 : acc;
+        acc *= sshape[i];
+    }
+
+    const uchar* sp = src.ptr();
+    uchar* dp = dst.ptr();
+    const size_t total = dst.total();
+    std::vector<int> idx(n, 0);
+    for (size_t t = 0; t < total; t++)
+    {
+        size_t tmp = t, soff = 0;
+        for (int i = n - 1; i >= 0; i--)
+        {
+            idx[i] = static_cast<int>(tmp % outShape[i]);
+            tmp /= outShape[i];
+        }
+        for (int i = 0; i < n; i++)
+            soff += static_cast<size_t>(idx[i]) * sstride[i];
+        memcpy(dp + t * esz, sp + soff * esz, esz);
+    }
+    return dst;
+}
+
+static std::vector<int> broadcastShapeRef(const std::vector<int>& a, const std::vector<int>& b)
+{
+    int na = static_cast<int>(a.size()), nb = static_cast<int>(b.size()), n = std::max(na, nb);
+    std::vector<int> out(n);
+    for (int i = 0; i < n; i++)
+    {
+        int ia = i - (n - na), ib = i - (n - nb);
+        int sa = ia < 0 ? 1 : a[ia];
+        int sb = ib < 0 ? 1 : b[ib];
+        out[i] = std::max(sa, sb);
+    }
+    return out;
+}
+
+static void runBroadcastBinary(const Mat& a, const Mat& b, char op, Mat& dst)
+{
+    switch (op)
+    {
+        case '+': cv::add(a, b, dst); break;
+        case '-': cv::subtract(a, b, dst); break;
+        case '*': cv::multiply(a, b, dst); break;
+        case '/': cv::divide(a, b, dst); break;
+        default: FAIL() << "bad op";
+    }
+}
+
+static void checkBroadcastOp(int type, const std::vector<int>& shapeA,
+                             const std::vector<int>& shapeB, char op)
+{
+    RNG& rng = theRNG();
+    Mat a(static_cast<int>(shapeA.size()), shapeA.data(), type);
+    Mat b(static_cast<int>(shapeB.size()), shapeB.data(), type);
+    // keep divisors away from zero so '/' is well defined and exactly reproducible
+    rng.fill(a, RNG::UNIFORM, Scalar::all(1), Scalar::all(50));
+    rng.fill(b, RNG::UNIFORM, Scalar::all(1), Scalar::all(50));
+
+    std::vector<int> outShape = broadcastShapeRef(shapeA, shapeB);
+    Mat ea = manualBroadcast(a, outShape);
+    Mat eb = manualBroadcast(b, outShape);
+    Mat ref;
+    runBroadcastBinary(ea, eb, op, ref);  // trusted equal-shape path on materialized inputs
+
+    Mat got;
+    runBroadcastBinary(a, b, op, got);    // broadcasting path under test
+
+    ASSERT_EQ(got.dims, static_cast<int>(outShape.size()));
+    for (int i = 0; i < got.dims; i++)
+        ASSERT_EQ(got.size[i], outShape[i]) << "axis " << i << " op " << op;
+    ASSERT_EQ(got.type(), ref.type());
+    // Both paths run the identical per-depth kernel on identical data -> bit-exact.
+    double diff = cvtest::norm(got, ref, NORM_INF);
+    ASSERT_EQ(diff, 0.0) << "op '" << op << "' type " << type;
+}
+
+TEST(Core_ArithmBroadcast, add_sub_mul_div)
+{
+    const std::vector<std::pair<std::vector<int>, std::vector<int>>> cases = {
+        {{10, 100, 800}, {1, 100, 800}},   // broadcast leading axis
+        {{10, 100, 800}, {10, 1, 800}},    // broadcast middle axis
+        {{10, 100, 800}, {10, 100, 1}},    // broadcast innermost axis
+        {{4, 2, 3}, {2, 3}},               // rank broadcast (b has fewer dims)
+        {{2, 1, 4}, {1, 3, 1}},            // bidirectional broadcast -> {2,3,4}
+    };
+    const int types[] = { CV_8UC1, CV_16SC1, CV_32SC1, CV_32FC1, CV_64FC1 };
+    for (int type : types)
+        for (const auto& c : cases)
+            for (char op : {'+', '-', '*', '/'})
+            {
+                SCOPED_TRACE(cv::format("type=%d op=%c", type, op));
+                checkBroadcastOp(type, c.first, c.second, op);
+            }
+}
+
+TEST(Core_ArithmBroadcast, multichannel)
+{
+    // 3-channel arrays with a broadcast spatial axis (channel counts must match).
+    for (char op : {'+', '-', '*', '/'})
+    {
+        checkBroadcastOp(CV_32FC3, {4, 1, 5}, {4, 3, 5}, op);
+        checkBroadcastOp(CV_8UC4,  {1, 6},    {7, 6},    op);
+    }
+}
+
+TEST(Core_ArithmBroadcast, inplace_dst_aliases_larger_operand)
+{
+    std::vector<int> shapeA{6, 4}, shapeB{1, 4};
+    Mat a(shapeA.size(), shapeA.data(), CV_32FC1);
+    Mat b(shapeB.size(), shapeB.data(), CV_32FC1);
+    theRNG().fill(a, RNG::UNIFORM, Scalar::all(1), Scalar::all(50));
+    theRNG().fill(b, RNG::UNIFORM, Scalar::all(1), Scalar::all(50));
+
+    Mat ref;
+    cv::add(a, manualBroadcast(b, shapeA), ref);
+    cv::add(a, b, a);  // in place, a is the broadcast result shape
+    ASSERT_EQ(cvtest::norm(a, ref, NORM_INF), 0.0);
+}
+
+TEST(Core_ArithmBroadcast, noncontiguous_roi_input)
+{
+    Mat big(20, 40, CV_32FC1);
+    theRNG().fill(big, RNG::UNIFORM, Scalar::all(1), Scalar::all(50));
+    Mat a = big(Rect(3, 2, 8, 6));          // non-contiguous ROI, shape (6,8)
+    std::vector<int> shapeB{1, 8};
+    Mat b(shapeB.size(), shapeB.data(), CV_32FC1);
+    theRNG().fill(b, RNG::UNIFORM, Scalar::all(1), Scalar::all(50));
+
+    Mat ea = a.clone(), ref;
+    cv::add(ea, manualBroadcast(b, {6, 8}), ref);
+    Mat got;
+    cv::add(a, b, got);
+    ASSERT_EQ(cvtest::norm(got, ref, NORM_INF), 0.0);
+}
+
+TEST(Core_ArithmBroadcast, incompatible_shapes_throw)
+{
+    Mat a(3, 5, CV_32FC1, Scalar(1));
+    Mat b(4, 5, CV_32FC1, Scalar(1));   // 3 vs 4 on a non-broadcast axis
+    Mat dst;
+    EXPECT_THROW(cv::add(a, b, dst), cv::Exception);
+}
+
 TEST(BroadcastTo, basic) {
     std::vector<int> shape_src{2, 1};
     std::vector<int> data_src{1, 2};

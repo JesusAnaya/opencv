@@ -1112,8 +1112,8 @@ void flipND(InputArray _src, OutputArray _dst, int _axis)
 /*
     This function first prepends 1 to each tensor shape to have a common max_ndims dimension, then flatten non-broadcast dimensions.
 */
-static bool _flatten_for_broadcast(int narrays, int max_ndims, const int* ndims, const int** orig_shape,
-                                   int** flatten_shape, size_t** flatten_step) {
+bool flattenForBroadcast(int narrays, int max_ndims, const int* ndims, const int** orig_shape,
+                         int** flatten_shape, size_t** flatten_step) {
     int i, j, k;
 
     // step 1.
@@ -1234,7 +1234,7 @@ void broadcast(InputArray _src, InputArray _shape, OutputArray _dst) {
     cv::AutoBuffer<size_t> buff(max_ndims * 4);
     int* flatten_shapes[2] = {(int*)buff.data(), (int*)(buff.data() + max_ndims)};
     size_t* flatten_steps[2] = {(size_t*)(buff.data() + 2 * max_ndims), (size_t*)(buff.data() + 3 * max_ndims)};
-    if (_flatten_for_broadcast(2, max_ndims, all_ndims, orig_shapes, flatten_shapes, flatten_steps)) {
+    if (flattenForBroadcast(2, max_ndims, all_ndims, orig_shapes, flatten_shapes, flatten_steps)) {
         size_t src_dp = flatten_steps[0][max_ndims - 1];
         size_t dst_dp = flatten_steps[1][max_ndims - 1];
         CV_Assert(dst_dp == 1 || dst_dp == 0);

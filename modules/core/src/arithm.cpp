@@ -620,6 +620,148 @@ typedef int (*ExtendedTypeFunc)(const uchar* src1, size_t step1,
                                 uchar* dst, size_t step, int width, int height,
                                 void*);
 
+// Compute the numpy-style broadcast result shape of two arrays.
+// Returns false (without throwing) when the shapes are not broadcast-compatible,
+// so the caller can fall through to the existing scalar / error handling.
+static bool getBroadcastShape(const Mat& a, const Mat& b, std::vector<int>& outShape)
+{
+    int na = a.dims, nb = b.dims;
+    int n = std::max(na, nb);
+    if (n < 1 || n > MatShape::MAX_DIMS)
+        return false;
+    outShape.resize(n);
+    for (int i = 0; i < n; i++)
+    {
+        int ia = i - (n - na);
+        int ib = i - (n - nb);
+        int sa = ia < 0 ? 1 : a.size.p[ia];
+        int sb = ib < 0 ? 1 : b.size.p[ib];
+        if (sa != sb && sa != 1 && sb != 1)
+            return false;
+        outShape[i] = std::max(sa, sb);
+    }
+    return true;
+}
+
+// N-dimensional, broadcasting, parallel binary element-wise executor (issues #29311/#29315).
+// Drives the existing per-depth BinaryFuncC kernels over broadcast (zero-step) strides without
+// materializing an expanded operand; only an innermost row is repeated into a small buffer when
+// an operand is broadcast along the last axis. Requires src1.type()==src2.type() (== dst.type()).
+static void binaryBroadcastOp(const Mat& src1_, const Mat& src2_, Mat& dst,
+                              BinaryFuncC func, int cn, void* usrdata)
+{
+    CV_Assert(func);
+    // flattenForBroadcast assumes contiguous inputs; clone only the (rare) non-contiguous ones.
+    Mat src1 = src1_.isContinuous() ? src1_ : src1_.clone();
+    Mat src2 = src2_.isContinuous() ? src2_ : src2_.clone();
+
+    const int max_ndims = dst.dims;
+    CV_Assert(max_ndims >= 1 && max_ndims <= MatShape::MAX_DIMS);
+
+    const int all_ndims[3] = { src1.dims, src2.dims, dst.dims };
+    const int* orig_shapes[3] = { src1.size.p, src2.size.p, dst.size.p };
+
+    std::vector<int> fshape_buf((size_t)max_ndims * 3);
+    std::vector<size_t> fstep_buf((size_t)max_ndims * 3);
+    int* fshape[3] = { &fshape_buf[0], &fshape_buf[max_ndims], &fshape_buf[2*max_ndims] };
+    size_t* fstep[3] = { &fstep_buf[0], &fstep_buf[max_ndims], &fstep_buf[2*max_ndims] };
+
+    bool ok = flattenForBroadcast(3, max_ndims, all_ndims, orig_shapes,
+                                  fshape, fstep);
+    CV_Assert(ok);
+
+    const int last = max_ndims - 1;
+    const int ncols = fshape[2][last];
+    const int nrows = max_ndims >= 2 ? fshape[2][last-1] : 1;
+    size_t nplanes = 1;
+    for (int k = 0; k <= last - 2; k++)
+        nplanes *= (size_t)fshape[2][k];
+
+    // steps are in element units; broadcast axes carry step 0
+    const size_t dp1 = fstep[0][last], dp2 = fstep[1][last];
+    const size_t rstep1 = max_ndims >= 2 ? fstep[0][last-1] : 0;
+    const size_t rstep2 = max_ndims >= 2 ? fstep[1][last-1] : 0;
+    const size_t rstepd = max_ndims >= 2 ? fstep[2][last-1] : 0;
+    const size_t esz = dst.elemSize(); // includes channels
+
+    const uchar* p1 = src1.ptr();
+    const uchar* p2 = src2.ptr();
+    uchar* pd = dst.ptr();
+    const int width = ncols * cn; // scalar lanes per row (channels folded into width)
+
+    // process rows [r0, r1) of a single plane; needs per-call scratch for innermost broadcast
+    auto processRows = [&](size_t plane, int r0, int r1, AutoBuffer<uchar>& rowbuf1,
+                                                          AutoBuffer<uchar>& rowbuf2)
+    {
+        size_t off1 = 0, off2 = 0, offd = 0, idx = plane;
+        for (int k = last - 2; k >= 0; k--)
+        {
+            size_t prev = idx / (size_t)fshape[2][k];
+            size_t ik = idx - prev * (size_t)fshape[2][k];
+            off1 += ik * fstep[0][k];
+            off2 += ik * fstep[1][k];
+            offd += ik * fstep[2][k];
+            idx = prev;
+        }
+        for (int i = r0; i < r1; i++)
+        {
+            const uchar* rp1 = p1 + (off1 + rstep1 * (size_t)i) * esz;
+            const uchar* rp2 = p2 + (off2 + rstep2 * (size_t)i) * esz;
+            uchar* rpd = pd + (offd + rstepd * (size_t)i) * esz;
+            const uchar* k1 = rp1;
+            const uchar* k2 = rp2;
+            if (dp1 == 0 && ncols > 1)
+            {
+                uchar* b = rowbuf1.data();
+                for (int j = 0; j < ncols; j++)
+                    memcpy(b + (size_t)j * esz, rp1, esz);
+                k1 = b;
+            }
+            if (dp2 == 0 && ncols > 1)
+            {
+                uchar* b = rowbuf2.data();
+                for (int j = 0; j < ncols; j++)
+                    memcpy(b + (size_t)j * esz, rp2, esz);
+                k2 = b;
+            }
+            func(k1, 0, k2, 0, rpd, 0, width, 1, usrdata);
+        }
+    };
+
+    const double total_work = (double)nplanes * nrows * ncols * (double)esz;
+    const double nstripes = std::max(1.0, total_work / 16384.0);
+    const bool runParallel = total_work >= (double)(1 << 16);
+    const size_t rowbytes = (size_t)ncols * esz;
+
+    if (nplanes == 1)
+    {
+        // single plane: parallelize across rows
+        auto body = [&](const Range& r)
+        {
+            AutoBuffer<uchar> rb1(dp1 == 0 ? rowbytes : 0), rb2(dp2 == 0 ? rowbytes : 0);
+            processRows(0, r.start, r.end, rb1, rb2);
+        };
+        if (runParallel)
+            parallel_for_(Range(0, nrows), body, nstripes);
+        else
+            body(Range(0, nrows));
+    }
+    else
+    {
+        // multiple planes: parallelize across planes, each thread handles full rows
+        auto body = [&](const Range& r)
+        {
+            AutoBuffer<uchar> rb1(dp1 == 0 ? rowbytes : 0), rb2(dp2 == 0 ? rowbytes : 0);
+            for (int pl = r.start; pl < r.end; pl++)
+                processRows((size_t)pl, 0, nrows, rb1, rb2);
+        };
+        if (runParallel)
+            parallel_for_(Range(0, (int)nplanes), body, nstripes);
+        else
+            body(Range(0, (int)nplanes));
+    }
+}
+
 static void arithm_op(InputArray _src1, InputArray _src2, OutputArray _dst,
                       InputArray _mask, int dtype, BinaryFuncC* tab, bool muldiv=false,
                       void* usrdata=0, int oclop=-1, ExtendedTypeFunc extendedFunc = nullptr,
@@ -661,6 +803,30 @@ static void arithm_op(InputArray _src1, InputArray _src2, OutputArray _dst,
             func(src1.ptr(), src1.step, src2.ptr(), src2.step, dst.ptr(), dst.step, sz.width, sz.height, usrdata);
         }
         return;
+    }
+
+    // Array-vs-array broadcasting (issues #29311/#29315): when the two inputs have different but
+    // numpy-broadcast-compatible shapes, evaluate without materializing an expanded operand.
+    // Kept intentionally narrow for now: no mask, identical type (so no dtype/wtype conversion),
+    // both real CPU arrays. Other cases fall through to the existing scalar/error handling below.
+    if( !haveMask && !src1Scalar && !src2Scalar && type1 == type2 &&
+        kind1 != _InputArray::UMAT && kind2 != _InputArray::UMAT &&
+        ((dtype < 0 && !_dst.fixedType()) ||
+         (_dst.fixedType() && _dst.type() == type1) ||
+         (dtype >= 0 && CV_MAT_DEPTH(dtype) == depth1)) )
+    {
+        Mat src1 = psrc1->getMat(), src2 = psrc2->getMat();
+        std::vector<int> bshape;
+        if( !src1.empty() && !src2.empty() && !psrc1->sameSize(*psrc2) &&
+            getBroadcastShape(src1, src2, bshape) )
+        {
+            _dst.create((int)bshape.size(), bshape.data(), type1);
+            Mat dst = _dst.getMat();
+            BinaryFuncC func = tab[depth1];
+            CV_Assert(func);
+            binaryBroadcastOp(src1, src2, dst, func, cn, usrdata);
+            return;
+        }
     }
 
     bool haveScalar = false, swapped12 = false;
